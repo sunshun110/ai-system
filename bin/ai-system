@@ -1,0 +1,826 @@
+#!/usr/bin/env python3
+"""Local CLI for the AI System project."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import tarfile
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, Iterable, List, MutableMapping, Sequence
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+STATE_VERSION = 1
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def rel(path: Path, root: Path = PROJECT_ROOT) -> str:
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
+def md_files(folder: Path) -> List[Path]:
+    if not folder.exists():
+        return []
+    return sorted(path for path in folder.glob("*.md") if path.is_file())
+
+
+def child_dirs(folder: Path) -> List[Path]:
+    if not folder.exists():
+        return []
+    return sorted(path for path in folder.iterdir() if path.is_dir())
+
+
+def print_list(title: str, items: Sequence[str]) -> None:
+    print(f"\n{title}")
+    if not items:
+        print("  (none)")
+        return
+    for item in items:
+        print(f"  - {item}")
+
+
+def read_json(path: Path, default: MutableMapping) -> MutableMapping:
+    if not path.exists():
+        return dict(default)
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_json(path: Path, data: MutableMapping, dry_run: bool = False) -> None:
+    if dry_run:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def available_adapters() -> List[str]:
+    return [path.name for path in child_dirs(PROJECT_ROOT / "adapters")]
+
+
+def available_domains() -> List[str]:
+    return [path.name for path in child_dirs(PROJECT_ROOT / "domains")]
+
+
+def available_departments() -> List[str]:
+    return [path.name for path in child_dirs(PROJECT_ROOT / "company" / "departments")]
+
+
+def names_from_files(folder: Path) -> List[str]:
+    return [path.stem for path in md_files(folder)]
+
+
+def installed_ai_dir(target: Path) -> Path:
+    return target / ".ai-system"
+
+
+def state_path(target: Path) -> Path:
+    return installed_ai_dir(target) / "state.json"
+
+
+def default_state(project_name: str) -> Dict:
+    return {
+        "schema": STATE_VERSION,
+        "project": {"name": project_name},
+        "source": {"path": str(PROJECT_ROOT)},
+        "installed_at": utc_now(),
+        "updated_at": utc_now(),
+        "adapters": [],
+        "domains": [],
+        "files": {},
+    }
+
+
+def load_state(target: Path) -> Dict:
+    return dict(read_json(state_path(target), default_state(target.name)))
+
+
+def save_state(target: Path, state: Dict, dry_run: bool = False) -> None:
+    state["updated_at"] = utc_now()
+    write_json(state_path(target), state, dry_run=dry_run)
+
+
+def ensure_known(items: Sequence[str], known: Sequence[str], label: str) -> None:
+    unknown = sorted(set(items) - set(known))
+    if unknown:
+        raise SystemExit(f"unknown {label}: {', '.join(unknown)}")
+
+
+class Installer:
+    def __init__(self, target: Path, force: bool = False, dry_run: bool = False, state: Dict | None = None) -> None:
+        self.target = target.resolve()
+        self.force = force
+        self.dry_run = dry_run
+        self.state = state if state is not None else load_state(self.target)
+        self.created: List[str] = []
+        self.skipped: List[str] = []
+        self.removed: List[str] = []
+
+    def track(self, path: Path, kind: str) -> None:
+        key = rel(path, self.target)
+        self.state.setdefault("files", {})[key] = kind
+
+    def untrack(self, path: Path) -> None:
+        key = rel(path, self.target)
+        self.state.setdefault("files", {}).pop(key, None)
+
+    def ensure_dir(self, path: Path) -> None:
+        if self.dry_run:
+            self.created.append(f"dir  {path}")
+            return
+        path.mkdir(parents=True, exist_ok=True)
+
+    def write_text(self, path: Path, text: str, kind: str = "generated") -> None:
+        if path.exists() and not self.force:
+            self.skipped.append(str(path))
+            return
+        if self.dry_run:
+            self.created.append(f"file {path}")
+            self.track(path, kind)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        self.created.append(str(path))
+        self.track(path, kind)
+
+    def copy_file(self, src: Path, dst: Path, kind: str = "copied") -> None:
+        if not src.exists():
+            return
+        if dst.exists() and not self.force:
+            self.skipped.append(str(dst))
+            return
+        if self.dry_run:
+            self.created.append(f"file {dst}")
+            self.track(dst, kind)
+            return
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        self.created.append(str(dst))
+        self.track(dst, kind)
+
+    def copy_tree_contents(self, src: Path, dst: Path, kind: str = "copied", exclude_names: Iterable[str] = ()) -> None:
+        if not src.exists():
+            return
+        exclude = set(exclude_names)
+        for item in sorted(src.rglob("*")):
+            relative = item.relative_to(src)
+            if any(part in exclude for part in relative.parts):
+                continue
+            if item.is_dir():
+                continue
+            self.copy_file(item, dst / relative, kind=kind)
+
+    def remove_path(self, path: Path) -> None:
+        if not path.exists():
+            self.untrack(path)
+            return
+        if self.dry_run:
+            self.removed.append(str(path))
+            self.untrack(path)
+            return
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        self.removed.append(str(path))
+        self.untrack(path)
+
+
+def generated_agents(project_name: str, domains: Sequence[str]) -> str:
+    domain_line = ", ".join(domains) if domains else "none"
+    return f"""# Project AI Rules
+
+This project uses the AI System installed in `.ai-system/`.
+
+## Project
+
+- Name: {project_name}
+- Active domain packs: {domain_line}
+
+## Rules
+
+- Read `.ai-system/core/constitution.md` before non-trivial work.
+- Use `.ai-system/core/context-loading.md` to decide what to read.
+- Use `.ai-system/core/risk-gates.md` before risky operations.
+- Use `.ai-system/core/verification.md` to report checks.
+- Keep project-specific rules in this project, not in the global AI System source.
+
+## Workflows
+
+Reusable workflows are installed under `.ai-system/workflows/`.
+Adapter-specific command wrappers may be installed under tool folders such as `.claude/`.
+"""
+
+
+def generated_profile(project_name: str, adapters: Sequence[str], domains: Sequence[str]) -> str:
+    adapter_lines = "\n".join(f"- {name}" for name in adapters) or "- none"
+    domain_lines = "\n".join(f"- {name}" for name in domains) or "- none"
+    return f"""# Project Profile
+
+## Project Identity
+
+- Name: {project_name}
+- Type:
+- Primary languages:
+- Runtime:
+- Package manager:
+
+## Installed Adapters
+
+{adapter_lines}
+
+## Active Domain Packs
+
+{domain_lines}
+
+## Verification Commands
+
+| Purpose | Command |
+|---|---|
+| Test | |
+| Typecheck | |
+| Lint | |
+| Build | |
+
+## Risk Notes
+
+- Public APIs:
+- Generated code:
+- External systems:
+- High-risk files:
+"""
+
+
+def generated_readme(project_name: str) -> str:
+    return f"""# {project_name}
+
+This project has AI System support installed in `.ai-system/`.
+
+## AI Commands
+
+```bash
+./ai-system/bin/ai-system doctor --target <this-project>
+```
+
+Read `AGENTS.md` for project AI rules.
+"""
+
+
+def install_core(installer: Installer) -> None:
+    ai_dir = installed_ai_dir(installer.target)
+    installer.copy_tree_contents(PROJECT_ROOT / "core", ai_dir / "core", kind="core")
+    installer.copy_tree_contents(PROJECT_ROOT / "docs", ai_dir / "docs", kind="doc")
+    installer.copy_tree_contents(PROJECT_ROOT / "workflows", ai_dir / "workflows", kind="workflow")
+    installer.copy_tree_contents(PROJECT_ROOT / "agents", ai_dir / "agents", kind="agent")
+    installer.copy_tree_contents(PROJECT_ROOT / "templates", ai_dir / "templates", kind="template")
+
+
+def install_adapter(installer: Installer, adapter: str) -> None:
+    source = PROJECT_ROOT / "adapters" / adapter
+    if not source.exists():
+        raise SystemExit(f"unknown adapter: {adapter}")
+
+    if adapter == "claude":
+        installer.copy_tree_contents(source / "commands", installer.target / ".claude" / "commands", kind=f"adapter:{adapter}")
+        installer.copy_tree_contents(source / "agents", installer.target / ".claude" / "agents", kind=f"adapter:{adapter}")
+        installer.copy_file(source / "settings.example.json", installer.target / ".claude" / "settings.example.json", kind=f"adapter:{adapter}")
+        installer.write_text(
+            installer.target / "CLAUDE.md",
+            "# Claude Project Rules\n\nRead `AGENTS.md` first, then use `.ai-system/` workflows and any active domain packs.\n",
+            kind=f"adapter:{adapter}",
+        )
+    elif adapter == "codex":
+        installer.copy_file(source / "README.md", installer.target / ".ai-system" / "adapters" / "codex.md", kind=f"adapter:{adapter}")
+    elif adapter == "cursor":
+        installer.copy_file(source / "README.md", installer.target / ".ai-system" / "adapters" / "cursor.md", kind=f"adapter:{adapter}")
+        installer.write_text(
+            installer.target / ".cursor" / "rules" / "ai-system.md",
+            "Use `AGENTS.md` and `.ai-system/` as the source of AI project rules.\n",
+            kind=f"adapter:{adapter}",
+        )
+    else:
+        installer.copy_tree_contents(source, installer.target / ".ai-system" / "adapters" / adapter, kind=f"adapter:{adapter}")
+
+    adapters = installer.state.setdefault("adapters", [])
+    if adapter not in adapters:
+        adapters.append(adapter)
+        adapters.sort()
+
+
+def install_domain(installer: Installer, domain: str) -> None:
+    source = PROJECT_ROOT / "domains" / domain
+    if not source.exists():
+        raise SystemExit(f"unknown domain: {domain}")
+    target = installer.target / ".ai-system" / "domains" / domain
+    installer.copy_file(source / "README.md", target / "README.md", kind=f"domain:{domain}")
+    installer.copy_tree_contents(source / "docs", target / "docs", kind=f"domain:{domain}")
+    installer.copy_tree_contents(source / "workflows", target / "workflows", kind=f"domain:{domain}")
+    installer.copy_tree_contents(source / "agents", target / "agents", kind=f"domain:{domain}")
+
+    domains = installer.state.setdefault("domains", [])
+    if domain not in domains:
+        domains.append(domain)
+        domains.sort()
+
+
+def sync_project_files(installer: Installer, project_name: str) -> None:
+    adapters = installer.state.get("adapters", [])
+    domains = installer.state.get("domains", [])
+    installer.write_text(installer.target / "AGENTS.md", generated_agents(project_name, domains), kind="generated")
+    installer.write_text(installed_ai_dir(installer.target) / "project-profile.md", generated_profile(project_name, adapters, domains), kind="generated")
+
+
+def command_info(_args: argparse.Namespace) -> int:
+    workflows = md_files(PROJECT_ROOT / "workflows")
+    agents = md_files(PROJECT_ROOT / "agents")
+    core = md_files(PROJECT_ROOT / "core")
+    docs = md_files(PROJECT_ROOT / "docs")
+    templates = md_files(PROJECT_ROOT / "templates")
+    company_roles = md_files(PROJECT_ROOT / "company" / "roles")
+    departments = child_dirs(PROJECT_ROOT / "company" / "departments")
+    adapters = child_dirs(PROJECT_ROOT / "adapters")
+    domains = child_dirs(PROJECT_ROOT / "domains")
+
+    print("AI System")
+    print(f"root: {PROJECT_ROOT}")
+    print(f"core docs: {len(core)}")
+    print(f"knowledge docs: {len(docs)}")
+    print(f"workflows: {len(workflows)}")
+    print(f"agents: {len(agents)}")
+    print(f"company roles: {len(company_roles)}")
+    print(f"departments: {len(departments)}")
+    print(f"templates: {len(templates)}")
+    print(f"adapters: {len(adapters)}")
+    print(f"domains: {len(domains)}")
+    print_list("Adapters", [path.name for path in adapters])
+    print_list("Company roles", [path.stem for path in company_roles])
+    print_list("Departments", [path.name for path in departments])
+    print_list("Domains", [path.name for path in domains])
+    return 0
+
+
+def command_list(args: argparse.Namespace) -> int:
+    groups = {
+        "core": names_from_files(PROJECT_ROOT / "core"),
+        "docs": names_from_files(PROJECT_ROOT / "docs"),
+        "workflows": names_from_files(PROJECT_ROOT / "workflows"),
+        "agents": names_from_files(PROJECT_ROOT / "agents"),
+        "company-roles": names_from_files(PROJECT_ROOT / "company" / "roles"),
+        "departments": available_departments(),
+        "templates": names_from_files(PROJECT_ROOT / "templates"),
+        "adapters": available_adapters(),
+        "domains": available_domains(),
+    }
+    selected = groups.keys() if args.kind == "all" else [args.kind]
+    for key in selected:
+        print_list(key, groups[key])
+    return 0
+
+
+def command_show(args: argparse.Namespace) -> int:
+    folders = {
+        "core": PROJECT_ROOT / "core",
+        "docs": PROJECT_ROOT / "docs",
+        "workflows": PROJECT_ROOT / "workflows",
+        "agents": PROJECT_ROOT / "agents",
+        "company-roles": PROJECT_ROOT / "company" / "roles",
+        "templates": PROJECT_ROOT / "templates",
+    }
+    if args.kind not in folders:
+        raise SystemExit(f"show supports: {', '.join(folders)}")
+    path = folders[args.kind] / f"{args.name}.md"
+    if not path.exists():
+        raise SystemExit(f"not found: {args.kind}/{args.name}")
+    print(path.read_text(encoding="utf-8"))
+    return 0
+
+
+def command_init(args: argparse.Namespace) -> int:
+    target = Path(args.target or ".").resolve()
+    project_name = args.name or target.name
+    adapters = args.adapter or []
+    domains = args.domain or []
+    ensure_known(adapters, available_adapters(), "adapter")
+    ensure_known(domains, available_domains(), "domain")
+
+    state = load_state(target)
+    state.setdefault("project", {})["name"] = project_name
+    installer = Installer(target=target, force=args.force, dry_run=args.dry_run, state=state)
+    installer.ensure_dir(target)
+    install_core(installer)
+    for domain in domains:
+        install_domain(installer, domain)
+    for adapter in adapters:
+        install_adapter(installer, adapter)
+    sync_project_files(installer, project_name)
+    save_state(target, installer.state, dry_run=args.dry_run)
+
+    print(f"initialized: {target}")
+    if installer.created:
+        print_list("Created or updated", installer.created)
+    if installer.skipped:
+        print_list("Skipped existing files (use --force to overwrite)", installer.skipped)
+    if args.dry_run:
+        print("\ndry run only; no files were written")
+    return 0
+
+
+def command_new_project(args: argparse.Namespace) -> int:
+    target = Path(args.path).resolve()
+    if target.exists() and any(target.iterdir()) and not args.force:
+        raise SystemExit(f"target exists and is not empty: {target} (use --force)")
+    target.mkdir(parents=True, exist_ok=True)
+    readme = target / "README.md"
+    if args.force or not readme.exists():
+        readme.write_text(generated_readme(args.name or target.name), encoding="utf-8")
+    init_args = argparse.Namespace(
+        target=str(target),
+        name=args.name or target.name,
+        adapter=args.adapter,
+        domain=args.domain,
+        force=args.force,
+        dry_run=False,
+    )
+    return command_init(init_args)
+
+
+def command_install(args: argparse.Namespace) -> int:
+    target = Path(args.target).resolve()
+    if not installed_ai_dir(target).exists():
+        raise SystemExit(f"AI System is not initialized in {target}; run init first")
+    adapters = args.adapter or []
+    domains = args.domain or []
+    ensure_known(adapters, available_adapters(), "adapter")
+    ensure_known(domains, available_domains(), "domain")
+
+    state = load_state(target)
+    installer = Installer(target=target, force=args.force, dry_run=args.dry_run, state=state)
+    for domain in domains:
+        install_domain(installer, domain)
+    for adapter in adapters:
+        install_adapter(installer, adapter)
+    project_name = state.get("project", {}).get("name", target.name)
+    sync_project_files(installer, project_name)
+    save_state(target, installer.state, dry_run=args.dry_run)
+
+    print(f"installed into: {target}")
+    if installer.created:
+        print_list("Created or updated", installer.created)
+    if installer.skipped:
+        print_list("Skipped existing files (use --force to overwrite)", installer.skipped)
+    if args.dry_run:
+        print("\ndry run only; no files were written")
+    return 0
+
+
+def remove_by_kind(installer: Installer, kind_prefix: str) -> None:
+    files = installer.state.setdefault("files", {})
+    matches = [installer.target / key for key, kind in files.items() if kind == kind_prefix]
+    for path in sorted(matches, reverse=True):
+        installer.remove_path(path)
+
+
+def prune_empty_dirs(root: Path, dry_run: bool = False) -> List[str]:
+    removed: List[str] = []
+    if not root.exists():
+        return removed
+    for path in sorted([p for p in root.rglob("*") if p.is_dir()], key=lambda p: len(p.parts), reverse=True):
+        try:
+            next(path.iterdir())
+        except StopIteration:
+            if dry_run:
+                removed.append(str(path))
+            else:
+                path.rmdir()
+                removed.append(str(path))
+    try:
+        next(root.iterdir())
+    except StopIteration:
+        if dry_run:
+            removed.append(str(root))
+        else:
+            root.rmdir()
+            removed.append(str(root))
+    return removed
+
+
+def command_remove(args: argparse.Namespace) -> int:
+    target = Path(args.target).resolve()
+    state = load_state(target)
+    installer = Installer(target=target, force=True, dry_run=args.dry_run, state=state)
+
+    if args.adapter:
+        ensure_known(args.adapter, available_adapters(), "adapter")
+        for adapter in args.adapter:
+            remove_by_kind(installer, f"adapter:{adapter}")
+            if adapter in installer.state.get("adapters", []):
+                installer.state["adapters"].remove(adapter)
+
+    if args.domain:
+        ensure_known(args.domain, available_domains(), "domain")
+        for domain in args.domain:
+            remove_by_kind(installer, f"domain:{domain}")
+            if domain in installer.state.get("domains", []):
+                installer.state["domains"].remove(domain)
+
+    if args.all:
+        for key in sorted(installer.state.get("files", {}).keys(), reverse=True):
+            path = target / key
+            if path == state_path(target):
+                continue
+            installer.remove_path(path)
+        installer.remove_path(installed_ai_dir(target))
+
+    if not args.all:
+        project_name = state.get("project", {}).get("name", target.name)
+        sync_project_files(installer, project_name)
+        save_state(target, installer.state, dry_run=args.dry_run)
+
+    removed_dirs = prune_empty_dirs(target / ".claude", dry_run=args.dry_run)
+    removed_dirs += prune_empty_dirs(target / ".cursor", dry_run=args.dry_run)
+    removed_dirs += prune_empty_dirs(target / ".ai-system" / "domains", dry_run=args.dry_run)
+    removed_dirs += prune_empty_dirs(target / ".ai-system" / "adapters", dry_run=args.dry_run)
+
+    print(f"removed from: {target}")
+    if installer.removed:
+        print_list("Removed", installer.removed)
+    if removed_dirs:
+        print_list("Removed empty dirs", removed_dirs)
+    if args.dry_run:
+        print("\ndry run only; no files were removed")
+    return 0
+
+
+def command_update(args: argparse.Namespace) -> int:
+    target = Path(args.target).resolve()
+    state = load_state(target)
+    if not installed_ai_dir(target).exists():
+        raise SystemExit(f"AI System is not initialized in {target}; run init first")
+    project_name = state.get("project", {}).get("name", target.name)
+    adapters = list(state.get("adapters", []))
+    domains = list(state.get("domains", []))
+    update_args = argparse.Namespace(
+        target=str(target),
+        name=project_name,
+        adapter=adapters,
+        domain=domains,
+        force=True,
+        dry_run=args.dry_run,
+    )
+    return command_init(update_args)
+
+
+def command_status(args: argparse.Namespace) -> int:
+    target = Path(args.target).resolve()
+    state = load_state(target)
+    print(f"target: {target}")
+    print(f"initialized: {installed_ai_dir(target).exists()}")
+    print(f"project: {state.get('project', {}).get('name', target.name)}")
+    print(f"updated_at: {state.get('updated_at', 'unknown')}")
+    print_list("adapters", state.get("adapters", []))
+    print_list("domains", state.get("domains", []))
+    print(f"\ntracked files: {len(state.get('files', {}))}")
+    return 0
+
+
+def command_doctor(args: argparse.Namespace) -> int:
+    root = Path(args.target).resolve() if args.target else PROJECT_ROOT
+    if root == PROJECT_ROOT:
+        expected = [
+            root / ".gitattributes",
+            root / ".gitignore",
+            root / ".github" / "workflows" / "ci.yml",
+            root / "README.md",
+            root / "README.zh-CN.md",
+            root / "SECURITY.md",
+            root / "AGENTS.md",
+            root / "DOCUMENTS.md",
+            root / "bin" / "ai-system",
+            root / "tools" / "repository_guard.py",
+            root / "tests" / "test_repository_guard.py",
+            root / "docs" / "PORTABILITY.md",
+            root / "docs" / "OPEN_SOURCE_REVIEW.md",
+            root / "core" / "constitution.md",
+            root / "core" / "context-loading.md",
+            root / "workflows" / "triage-issue.md",
+            root / "agents" / "code-reviewer.md",
+            root / "templates" / "project-profile.md",
+            root / "company" / "AGENTS.md",
+            root / "company" / "roles" / "策划.md",
+            root / "company" / "roles" / "程序.md",
+            root / "company" / "roles" / "测试.md",
+            root / "company" / "roles" / "运维架构师.md",
+            root / "company" / "departments" / "h5-game" / "AGENTS.md",
+        ]
+    else:
+        expected = [
+            root / "AGENTS.md",
+            root / ".ai-system" / "core" / "constitution.md",
+            root / ".ai-system" / "workflows" / "triage-issue.md",
+            root / ".ai-system" / "project-profile.md",
+            root / ".ai-system" / "state.json",
+        ]
+
+    missing = [path for path in expected if not path.exists()]
+    if missing:
+        print("doctor: issues found")
+        print_list("Missing", [str(path) for path in missing])
+        return 1
+
+    if root != PROJECT_ROOT:
+        state = load_state(root)
+        files = state.get("files", {})
+        tracked_missing = [key for key in files if not (root / key).exists()]
+        if tracked_missing:
+            print("doctor: issues found")
+            print_list("Tracked files missing", tracked_missing)
+            return 1
+
+    print("doctor: ok")
+    print(f"target: {root}")
+    return 0
+
+
+def command_validate(args: argparse.Namespace) -> int:
+    status = 0
+    status |= command_doctor(argparse.Namespace(target=args.target))
+    target = Path(args.target).resolve() if args.target else PROJECT_ROOT
+    if target != PROJECT_ROOT:
+        state = load_state(target)
+        unknown_adapters = sorted(set(state.get("adapters", [])) - set(available_adapters()))
+        unknown_domains = sorted(set(state.get("domains", [])) - set(available_domains()))
+        if unknown_adapters or unknown_domains:
+            print("validate: issues found")
+            if unknown_adapters:
+                print_list("Unknown adapters in state", unknown_adapters)
+            if unknown_domains:
+                print_list("Unknown domains in state", unknown_domains)
+            status = 1
+    if status == 0:
+        print("validate: ok")
+    return status
+
+
+def command_export(args: argparse.Namespace) -> int:
+    output = Path(args.output).resolve() if args.output else Path.cwd() / "ai-system-export.tar.gz"
+    excluded_parts = {
+        ".DS_Store",
+        ".git",
+        ".kiro",
+        ".local",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        ".venv",
+        "__pycache__",
+        "env",
+        "venv",
+    }
+    archive_suffixes = (".tar", ".tar.bz2", ".tar.gz", ".tar.xz", ".tgz", ".zip")
+    with tarfile.open(output, "w:gz") as archive:
+        for item in sorted(PROJECT_ROOT.rglob("*")):
+            relative = item.relative_to(PROJECT_ROOT)
+            if any(part in excluded_parts for part in relative.parts):
+                continue
+            if item.resolve() == output or (item.is_file() and item.name.casefold().endswith(archive_suffixes)):
+                continue
+            archive.add(item, arcname=Path("ai-system") / relative, recursive=False)
+    print(f"exported: {output}")
+    return 0
+
+
+def command_demo(args: argparse.Namespace) -> int:
+    target = Path(args.target).resolve() if args.target else Path(tempfile.mkdtemp(prefix="ai-system-demo."))
+    adapters = args.adapter or ["claude"]
+    domains = args.domain or []
+    project_name = args.name or target.name
+
+    print(f"demo target: {target}")
+    print("step 1/3: create project and install AI System")
+    command_new_project(
+        argparse.Namespace(
+            path=str(target),
+            name=project_name,
+            adapter=adapters,
+            domain=domains,
+            force=True,
+        )
+    )
+    print("\nstep 2/3: validate")
+    command_validate(argparse.Namespace(target=str(target)))
+    print("\nstep 3/3: status")
+    command_status(argparse.Namespace(target=str(target)))
+    print("\nDemo project is ready.")
+    print(f"Inspect it with: find {target} -maxdepth 3 -type f | sort")
+    print(f"Remove AI System with: {PROJECT_ROOT / 'bin' / 'ai-system'} remove --target {target} --all")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="ai-system", description="Manage and install the AI System.")
+    sub = parser.add_subparsers(dest="command")
+
+    info = sub.add_parser("info", help="Show system summary.")
+    info.set_defaults(func=command_info)
+
+    list_cmd = sub.add_parser("list", help="List system assets.")
+    list_cmd.add_argument(
+        "kind",
+        nargs="?",
+        default="all",
+        choices=["all", "core", "docs", "workflows", "agents", "company-roles", "departments", "templates", "adapters", "domains"],
+    )
+    list_cmd.set_defaults(func=command_list)
+
+    show = sub.add_parser("show", help="Print an installed source document.")
+    show.add_argument("kind", choices=["core", "docs", "workflows", "agents", "company-roles", "templates"])
+    show.add_argument("name")
+    show.set_defaults(func=command_show)
+
+    init = sub.add_parser("init", help="Install AI System files into a target project.")
+    add_target_options(init)
+    init.set_defaults(func=command_init)
+
+    new_project = sub.add_parser("new-project", help="Create a project folder and install AI System.")
+    new_project.add_argument("path", help="Project folder to create.")
+    new_project.add_argument("--name", help="Project name. Defaults to folder name.")
+    new_project.add_argument("--adapter", action="append", choices=available_adapters(), help="Adapter to install. Repeatable.")
+    new_project.add_argument("--domain", action="append", choices=available_domains(), help="Domain pack to install. Repeatable.")
+    new_project.add_argument("--force", action="store_true", help="Allow existing non-empty target.")
+    new_project.set_defaults(func=command_new_project)
+
+    install = sub.add_parser("install", help="Install adapters or domains into an initialized project.")
+    install.add_argument("--target", default=".", help="Target project folder.")
+    install.add_argument("--adapter", action="append", choices=available_adapters(), help="Adapter to install. Repeatable.")
+    install.add_argument("--domain", action="append", choices=available_domains(), help="Domain pack to install. Repeatable.")
+    install.add_argument("--force", action="store_true", help="Overwrite existing files.")
+    install.add_argument("--dry-run", action="store_true", help="Print planned writes without changing files.")
+    install.set_defaults(func=command_install)
+
+    remove = sub.add_parser("remove", help="Remove adapters, domains, or the whole installed AI System.")
+    remove.add_argument("--target", default=".", help="Target project folder.")
+    remove.add_argument("--adapter", action="append", choices=available_adapters(), help="Adapter to remove. Repeatable.")
+    remove.add_argument("--domain", action="append", choices=available_domains(), help="Domain pack to remove. Repeatable.")
+    remove.add_argument("--all", action="store_true", help="Remove the installed AI System.")
+    remove.add_argument("--dry-run", action="store_true", help="Print planned removals without changing files.")
+    remove.set_defaults(func=command_remove)
+
+    update = sub.add_parser("update", help="Refresh an initialized project from this source tree.")
+    update.add_argument("--target", default=".", help="Target project folder.")
+    update.add_argument("--dry-run", action="store_true", help="Print planned writes without changing files.")
+    update.set_defaults(func=command_update)
+
+    status = sub.add_parser("status", help="Show installed AI System state for a target project.")
+    status.add_argument("--target", default=".", help="Target project folder.")
+    status.set_defaults(func=command_status)
+
+    doctor = sub.add_parser("doctor", help="Check a source or installed AI System.")
+    doctor.add_argument("--target", help="Target project folder. Defaults to this ai-system source.")
+    doctor.set_defaults(func=command_doctor)
+
+    validate = sub.add_parser("validate", help="Run doctor plus state consistency checks.")
+    validate.add_argument("--target", help="Target project folder. Defaults to this ai-system source.")
+    validate.set_defaults(func=command_validate)
+
+    export = sub.add_parser("export", help="Export this AI System source tree as a tar.gz archive.")
+    export.add_argument("--output", help="Output tar.gz path. Defaults to ./ai-system-export.tar.gz")
+    export.set_defaults(func=command_export)
+
+    demo = sub.add_parser("demo", help="Create a temporary demo project and install AI System.")
+    demo.add_argument("--target", help="Demo project folder. Defaults to a new /tmp folder.")
+    demo.add_argument("--name", help="Demo project name. Defaults to target folder name.")
+    demo.add_argument("--adapter", action="append", choices=available_adapters(), help="Adapter to install. Defaults to claude.")
+    demo.add_argument("--domain", action="append", choices=available_domains(), help="Domain pack to install. Repeatable.")
+    demo.set_defaults(func=command_demo)
+
+    return parser
+
+
+def add_target_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--target", default=".", help="Target project folder. Defaults to current directory.")
+    parser.add_argument("--name", help="Project name. Defaults to target folder name.")
+    parser.add_argument("--adapter", action="append", choices=available_adapters(), help="Adapter to install. Repeatable.")
+    parser.add_argument("--domain", action="append", choices=available_domains(), help="Domain pack to install. Repeatable.")
+    parser.add_argument("--force", action="store_true", help="Overwrite existing files.")
+    parser.add_argument("--dry-run", action="store_true", help="Print planned writes without changing files.")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not hasattr(args, "func"):
+        args = parser.parse_args(["info"])
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,20 @@
+* text=auto
+
+*.py text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.sh text eol=lf
+bin/ai-system text eol=lf
+
+*.png -text -diff
+*.jpg -text -diff
+*.jpeg -text -diff
+*.gif -text -diff
+*.webp -text -diff
+*.ico -text -diff
+*.pdf -text -diff
+*.zip -text -diff
+*.gz -text -diff
+*.tgz -text -diff

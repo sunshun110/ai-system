@@ -1,0 +1,58 @@
+# macOS and Windows metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Thumbs.db
+Desktop.ini
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.venv/
+venv/
+env/
+ENV/
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+
+# Editor and local tool state
+.idea/
+.kiro/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment, credentials, and private keys
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
+
+# Portable exports and generated archives
+ai-system-export*.tar.gz
+ai-system-export*.tgz
+*.zip
+
+# Local-only repository data
+.local/
